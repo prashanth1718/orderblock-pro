@@ -9,9 +9,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="OrderBlock Pro V3.1", page_icon="📊", layout="wide")
-st.title("📊 OrderBlock Pro V3.1 — Full NSE F&O Scanner")
-st.caption("5-minute + 15-minute confirmation | Expandable scan up to all loaded stock-F&O underlyings | No order placement")
+st.set_page_config(page_title="OrderBlock Pro V4", page_icon="📊", layout="wide")
+st.title("📊 OrderBlock Pro V4 — NSE F&O + Options Intelligence")
+st.caption("5m + 15m stock scan | ATM / ITM / OTM option-chain view | Greeks, OI and liquidity checks | No order placement")
 
 IST = ZoneInfo("Asia/Kolkata")
 MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
@@ -87,6 +87,75 @@ def analyse(frame, swing_lookback, volume_multiple):
         "candle_time": last["datetime"],
     }
 
+def get_option_contracts(underlying_key, token):
+    url = "https://api.upstox.com/v2/option/contract"
+    response = requests.get(url, params={"instrument_key": underlying_key}, headers=auth_headers(token), timeout=25)
+    if response.status_code == 401:
+        raise RuntimeError("Upstox token rejected/expired (401). Refresh the token in Streamlit Secrets.")
+    response.raise_for_status()
+    return response.json().get("data", [])
+
+def get_option_chain(underlying_key, expiry, token):
+    url = "https://api.upstox.com/v2/option/chain"
+    response = requests.get(url, params={"instrument_key": underlying_key, "expiry_date": expiry}, headers=auth_headers(token), timeout=25)
+    if response.status_code == 401:
+        raise RuntimeError("Upstox token rejected/expired (401). Refresh the token in Streamlit Secrets.")
+    if response.status_code == 429:
+        raise RuntimeError("Upstox rate limit reached (429). Retry later with fewer symbols.")
+    response.raise_for_status()
+    return response.json().get("data", [])
+
+def build_option_rows(symbol, underlying_key, direction, token, max_spread_pct):
+    contracts = get_option_contracts(underlying_key, token)
+    today = datetime.now(IST).date()
+    expiries = sorted({str(c.get("expiry")) for c in contracts if c.get("expiry") and str(c.get("expiry")) >= today.isoformat()})
+    if not expiries:
+        return [], f"{symbol}: no future option expiry returned"
+    expiry = expiries[0]
+    chain = get_option_chain(underlying_key, expiry, token)
+    if not chain:
+        return [], f"{symbol}: empty option chain for {expiry}"
+    spot = float(chain[0].get("underlying_spot_price") or 0)
+    strikes = sorted({float(x.get("strike_price")) for x in chain if x.get("strike_price") is not None})
+    if not spot or not strikes:
+        return [], f"{symbol}: missing spot/strike data"
+    atm = min(strikes, key=lambda x: abs(x-spot))
+    atm_idx = strikes.index(atm)
+    # Directional contract candidates: bullish uses CE; bearish uses PE.
+    opt_type = "CE" if direction == "Bullish" else "PE"
+    wanted = []
+    for offset, label in [(0, "ATM"), (1, "1-step OTM"), (2, "2-step OTM"), (-1, "1-step ITM"), (-2, "2-step ITM")]:
+        idx = atm_idx + offset if opt_type == "CE" else atm_idx - offset
+        if 0 <= idx < len(strikes):
+            wanted.append((strikes[idx], label))
+    by_strike = {float(x["strike_price"]): x for x in chain if x.get("strike_price") is not None}
+    rows = []
+    for strike, moneyness in wanted:
+        item = by_strike.get(strike, {})
+        opt = item.get("call_options" if opt_type == "CE" else "put_options") or {}
+        md = opt.get("market_data") or {}
+        gr = opt.get("option_greeks") or {}
+        ltp = float(md.get("ltp") or 0)
+        bid = float(md.get("bid_price") or 0)
+        ask = float(md.get("ask_price") or 0)
+        spread = ((ask-bid)/((ask+bid)/2)*100) if bid > 0 and ask > 0 and ask >= bid else None
+        liquid = ltp > 0 and bid > 0 and ask > 0 and spread is not None and spread <= max_spread_pct and float(md.get("volume") or 0) > 0
+        # Reference risk levels only; not an execution instruction or tested edge.
+        rows.append({
+            "Symbol": symbol, "Bias": direction, "Expiry": expiry, "Option": opt_type,
+            "Strike": strike, "Moneyness": moneyness, "Spot": round(spot,2),
+            "LTP": round(ltp,2), "Bid": round(bid,2), "Ask": round(ask,2),
+            "Spread %": round(spread,2) if spread is not None else None,
+            "Volume": int(float(md.get("volume") or 0)), "OI": int(float(md.get("oi") or 0)),
+            "Delta": gr.get("delta"), "Theta": gr.get("theta"), "Gamma": gr.get("gamma"),
+            "Vega": gr.get("vega"), "IV": gr.get("iv"), "Liquidity": "PASS" if liquid else "REJECT",
+            "Reference SL (-20%)": round(ltp*0.8,2) if ltp else None,
+            "Reference T1 (+40%)": round(ltp*1.4,2) if ltp else None,
+            "Reference T2 (+60%)": round(ltp*1.6,2) if ltp else None,
+            "Instrument Key": opt.get("instrument_key", "")
+        })
+    return rows, None
+
 def market_status(now):
     if now.weekday() >= 5:
         return "Market closed (weekend)"
@@ -115,7 +184,7 @@ with st.sidebar:
     swing = st.slider("Liquidity-sweep lookback", 3, 20, 5)
     vol_mult = st.slider("Volume spike multiple", 1.0, 3.0, 1.5, 0.1)
 
-st.warning("A full 218-stock scan makes up to 436 candle requests (one 5m and one 15m request per stock). It can take several minutes and may be affected by API limits, network interruptions or token expiry. Start with 20 or 50 first. Results are underlying-stock watchlist candidates only; options chain, Greeks, futures OI confirmation and strike/premium selection are not included.")
+st.warning("A full 218-stock scan makes up to 436 candle requests. Start with 20 or 50. Options Intelligence is a separate on-demand lookup for the top 5 bullish and bearish scan candidates; it uses the nearest listed expiry and shows live chain fields returned by Upstox. No order placement.")
 
 if st.button("Load / refresh NSE F&O stock list"):
     try:
@@ -208,3 +277,48 @@ else:
                 st.write(st.session_state["v31_errors"])
 
 st.caption("Technical heuristic only: EMA20/EMA50, relative volume, swing-sweep and three-candle FVG checks. It does not prove institutional activity or a profitable edge. No trades are placed.")
+
+
+# V4 Options Intelligence: separate, user-triggered option-chain lookup.
+st.divider()
+st.header("🧠 V4 Options Intelligence")
+st.caption("Uses Upstox option contracts + option-chain endpoints. Displays CE for bullish candidates and PE for bearish candidates, with ATM, 1/2-step OTM and 1/2-step ITM. Greeks, OI, volume and bid/ask are shown only when supplied by the API.")
+max_spread = st.slider("Maximum bid–ask spread for liquidity PASS (%)", 1, 30, 10)
+if st.button("🔎 Load Options Intelligence", disabled=(not bool(token) or "v31_records" not in st.session_state)):
+    scan_df = pd.DataFrame(st.session_state.get("v31_records", []))
+    if scan_df.empty:
+        st.warning("Run the stock scan first.")
+    else:
+        bull_top = scan_df[(scan_df["5m Bull"] >= min_score) & (scan_df["15m Bull"] >= min_score) & (scan_df["Bull total"] > scan_df["Bear total"])].sort_values("Bull total", ascending=False).head(5)
+        bear_top = scan_df[(scan_df["5m Bear"] >= min_score) & (scan_df["15m Bear"] >= min_score) & (scan_df["Bear total"] > scan_df["Bull total"])].sort_values("Bear total", ascending=False).head(5)
+        universe_map = st.session_state["universe"].set_index("underlying_symbol")["underlying_key"].to_dict()
+        opt_rows, opt_errors = [], []
+        picks = [(r["Symbol"], "Bullish") for _, r in bull_top.iterrows()] + [(r["Symbol"], "Bearish") for _, r in bear_top.iterrows()]
+        if not picks:
+            st.info("No bullish/bearish candidates passed the current scan filters.")
+        progress = st.progress(0)
+        for i, (sym, bias) in enumerate(picks, start=1):
+            try:
+                rows, err = build_option_rows(sym, universe_map[sym], bias, token, max_spread)
+                opt_rows.extend(rows)
+                if err: opt_errors.append(err)
+            except Exception as exc:
+                opt_errors.append(f"{sym}: {str(exc)[:160]}")
+            progress.progress(i/max(len(picks),1))
+            time.sleep(0.15)
+        st.session_state["v4_options"] = opt_rows
+        st.session_state["v4_option_errors"] = opt_errors
+        st.session_state["v4_option_time"] = datetime.now(IST).strftime("%d %b %Y %I:%M:%S %p")
+if "v4_options" in st.session_state:
+    opt_df = pd.DataFrame(st.session_state["v4_options"])
+    st.caption(f"Option-chain lookup: {st.session_state.get('v4_option_time','')} | Contracts shown: {len(opt_df)}")
+    if not opt_df.empty:
+        st.markdown("**Liquidity PASS** means live LTP, bid, ask and volume are present and spread is within your selected limit. REJECT rows are displayed for comparison, not trade selection.**")
+        st.dataframe(opt_df.drop(columns=["Instrument Key"]), use_container_width=True, hide_index=True)
+        st.download_button("Download Options Intelligence CSV", opt_df.to_csv(index=False), "orderblock_pro_v4_options.csv", "text/csv")
+        st.info("Reference SL/T1/T2 are simple premium-percentage illustrations (-20%, +40%, +60%), not chart-derived levels, not guaranteed, and not validated. They imply 1:2 and 1:3 reward/risk before brokerage, slippage and gaps. Only consider rows marked PASS; confirm live quotes before any decision.")
+    if st.session_state.get("v4_option_errors"):
+        with st.expander(f"Option lookup warnings ({len(st.session_state['v4_option_errors'])})"):
+            st.write(st.session_state["v4_option_errors"])
+
+st.caption("V4 is a first Options Intelligence integration, not a proven trading system. Futures OI confirmation and actual Order Block detection are not yet implemented. No automated order placement.")
