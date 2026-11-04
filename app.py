@@ -1,12 +1,19 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import requests
+import gzip
+import io
+import time
 from urllib.parse import quote
 
-st.set_page_config(page_title="OrderBlock Pro", page_icon="📊", layout="wide")
-st.title("📊 OrderBlock Pro — Upstox Live Connection Test")
-st.caption("NSE F&O research dashboard | 5-minute and 15-minute candle analysis")
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+
+st.set_page_config(page_title="OrderBlock Pro V2", page_icon="📊", layout="wide")
+st.title("📊 OrderBlock Pro V2 — NSE F&O Scanner")
+st.caption("Live underlying-stock research scanner | 5-minute & 15-minute | No order placement")
+
+MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
+BASE = "https://api.upstox.com/v3"
 
 def get_token():
     try:
@@ -14,104 +21,157 @@ def get_token():
     except Exception:
         return None
 
-def fetch_intraday(instrument_key: str, interval: int, token: str) -> pd.DataFrame:
-    encoded_key = quote(instrument_key, safe="")
-    url = f"https://api.upstox.com/v3/historical-candle/intraday/{encoded_key}/minutes/{interval}"
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
-    response = requests.get(url, headers=headers, timeout=20)
-    if response.status_code == 401:
-        raise RuntimeError("Upstox rejected the token (401). Generate a fresh access token and update Streamlit Secrets.")
-    if response.status_code == 403:
-        raise RuntimeError("Upstox denied access (403). Check API app permissions and market-data access.")
-    response.raise_for_status()
-    payload = response.json()
-    candles = payload.get("data", {}).get("candles", [])
-    if not candles:
-        raise RuntimeError("No intraday candles returned. Check the instrument key, market session, and API access.")
-    df = pd.DataFrame(candles, columns=["datetime", "open", "high", "low", "close", "volume", "oi"][:len(candles[0])])
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
-    return df.sort_values("datetime").reset_index(drop=True)
+def headers(token):
+    return {"Accept": "application/json", "Authorization": f"Bearer {token}"}
 
-def analyze(df: pd.DataFrame, swing: int, volume_multiple: float) -> pd.DataFrame:
-    df = df.copy()
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["open", "high", "low", "close", "volume"]).copy()
-    if len(df) < max(25, swing + 3):
-        raise ValueError("Not enough candles yet for the indicator set.")
-    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
-    df["vol_avg20"] = df["volume"].rolling(20).mean()
-    df["vol_spike"] = df["volume"] >= df["vol_avg20"] * volume_multiple
-    df["prior_high"] = df["high"].shift(1).rolling(swing).max()
-    df["prior_low"] = df["low"].shift(1).rolling(swing).min()
-    df["bull_sweep"] = (df["low"] < df["prior_low"]) & (df["close"] > df["prior_low"])
-    df["bear_sweep"] = (df["high"] > df["prior_high"]) & (df["close"] < df["prior_high"])
-    df["bull_fvg"] = df["low"] > df["high"].shift(2)
-    df["bear_fvg"] = df["high"] < df["low"].shift(2)
-    df["bull_score"] = (
-        df["bull_sweep"].fillna(False).astype(int)
-        + df["bull_fvg"].fillna(False).astype(int)
-        + df["vol_spike"].fillna(False).astype(int)
-        + (df["close"] > df["ema20"]).fillna(False).astype(int)
-        + (df["ema20"] > df["ema50"]).fillna(False).astype(int)
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_stock_fno_universe():
+    """Load current Upstox instrument master; use equity underlyings with NSE stock futures."""
+    r = requests.get(MASTER_URL, timeout=45)
+    r.raise_for_status()
+    raw = r.content
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    data = pd.read_json(io.BytesIO(raw))
+    required = {"segment", "instrument_type", "underlying_type", "underlying_key", "underlying_symbol"}
+    if not required.issubset(data.columns):
+        raise RuntimeError("Upstox instrument master format changed; required fields were not found.")
+    fut = data[
+        (data["segment"] == "NSE_FO")
+        & (data["instrument_type"] == "FUT")
+        & (data["underlying_type"] == "EQUITY")
+    ].copy()
+    fut = fut.dropna(subset=["underlying_key", "underlying_symbol"])
+    universe = (
+        fut.sort_values("expiry")
+        .drop_duplicates("underlying_key")
+        [["underlying_symbol", "underlying_key"]]
+        .sort_values("underlying_symbol")
+        .reset_index(drop=True)
     )
-    df["bear_score"] = (
-        df["bear_sweep"].fillna(False).astype(int)
-        + df["bear_fvg"].fillna(False).astype(int)
-        + df["vol_spike"].fillna(False).astype(int)
-        + (df["close"] < df["ema20"]).fillna(False).astype(int)
-        + (df["ema20"] < df["ema50"]).fillna(False).astype(int)
-    )
-    return df
+    if universe.empty:
+        raise RuntimeError("No NSE equity stock-futures underlyings found in the current instrument master.")
+    return universe
+
+def fetch_candles(key, minutes, token):
+    url = f"{BASE}/historical-candle/intraday/{quote(key, safe='')}/minutes/{minutes}"
+    r = requests.get(url, headers=headers(token), timeout=20)
+    if r.status_code == 401:
+        raise RuntimeError("Upstox token expired or rejected (401). Generate a fresh token and update Streamlit Secrets.")
+    r.raise_for_status()
+    candles = r.json().get("data", {}).get("candles", [])
+    if not candles:
+        return pd.DataFrame()
+    cols = ["datetime", "open", "high", "low", "close", "volume", "oi"][:len(candles[0])]
+    df = pd.DataFrame(candles, columns=cols)
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce")
+    return df.dropna(subset=["datetime", "close"]).sort_values("datetime").reset_index(drop=True)
+
+def score(df, swing, vol_mult):
+    if len(df) < 25:
+        return None
+    x = df.copy()
+    x["ema20"] = x.close.ewm(span=20, adjust=False).mean()
+    x["ema50"] = x.close.ewm(span=50, adjust=False).mean()
+    x["vavg"] = x.volume.rolling(20).mean()
+    x["vol_spike"] = x.volume >= x.vavg * vol_mult
+    prior_hi = x.high.shift(1).rolling(swing).max()
+    prior_lo = x.low.shift(1).rolling(swing).min()
+    bull_sweep = (x.low < prior_lo) & (x.close > prior_lo)
+    bear_sweep = (x.high > prior_hi) & (x.close < prior_hi)
+    bull_fvg = x.low > x.high.shift(2)
+    bear_fvg = x.high < x.low.shift(2)
+    last = x.iloc[-1]
+    bull = int(bool(bull_sweep.iloc[-1])) + int(bool(bull_fvg.iloc[-1])) + int(bool(last.vol_spike)) + int(last.close > last.ema20) + int(last.ema20 > last.ema50)
+    bear = int(bool(bear_sweep.iloc[-1])) + int(bool(bear_fvg.iloc[-1])) + int(bool(last.vol_spike)) + int(last.close < last.ema20) + int(last.ema20 < last.ema50)
+    return {
+        "LTP": float(last.close), "Bull score": bull, "Bear score": bear,
+        "Volume spike": "Yes" if bool(last.vol_spike) else "No",
+        "Bull sweep": "Yes" if bool(bull_sweep.iloc[-1]) else "No",
+        "Bear sweep": "Yes" if bool(bear_sweep.iloc[-1]) else "No",
+        "Bull FVG": "Yes" if bool(bull_fvg.iloc[-1]) else "No",
+        "Bear FVG": "Yes" if bool(bear_fvg.iloc[-1]) else "No",
+        "Last candle": str(last.datetime)
+    }
 
 token = get_token()
 if token:
-    st.success("Upstox access token found in Streamlit Secrets.")
+    st.success("Upstox access token found.")
 else:
-    st.error("Upstox token not found. In Streamlit App settings → Secrets, add [upstox] and access_token.")
+    st.error("Token missing. Add [upstox] and access_token in Streamlit → App settings → Secrets.")
 
 with st.sidebar:
-    st.header("Scanner settings")
-    timeframe = st.selectbox("Analysis timeframe", ["5-minute", "15-minute"])
-    interval = 5 if timeframe == "5-minute" else 15
-    swing = st.slider("Swing lookback", 3, 20, 5)
-    vol_mult = st.slider("Volume spike threshold", 1.0, 3.0, 1.5, 0.1)
+    st.header("Scanner controls")
+    tf = st.selectbox("Timeframe", ["5-minute", "15-minute"])
+    minutes = 5 if tf == "5-minute" else 15
+    limit = st.select_slider("Stocks to scan per run", options=[10, 20, 30, 50], value=20)
+    threshold = st.slider("Minimum score", 2, 5, 4)
+    swing = st.slider("Liquidity-sweep lookback", 3, 20, 5)
+    vol_mult = st.slider("Volume spike multiple", 1.0, 3.0, 1.5, 0.1)
 
-st.subheader("Live candle test")
-st.write("Enter a valid Upstox instrument key. Example: `NSE_EQ|INE848E01016` (NHPC).")
-instrument_key = st.text_input("Upstox instrument key", value="NSE_EQ|INE848E01016")
-if st.button("Fetch live intraday candles", type="primary", disabled=not bool(token)):
+st.warning("V2 scans a selectable sample of NSE stock-F&O underlyings. Results are watchlist candidates only—not option-buy signals. Options chain, Greeks, futures OI confirmation and strike/premium selection are not included yet.")
+
+if st.button("Load / refresh NSE F&O stock list"):
     try:
-        with st.spinner("Requesting candles from Upstox..."):
-            candles = fetch_intraday(instrument_key.strip(), interval, token)
-        st.success(f"Received {len(candles)} candles from Upstox.")
-        analyzed = analyze(candles, swing, vol_mult)
-        last = analyzed.iloc[-1]
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Latest close", f"{last.close:,.2f}")
-        m2.metric("Bullish score", f"{int(last.bull_score)}/5")
-        m3.metric("Bearish score", f"{int(last.bear_score)}/5")
-        m4.metric("Volume spike", "Yes" if bool(last.vol_spike) else "No")
-        if last.bull_score >= 4 and last.bull_score > last.bear_score:
-            st.success("Bullish setup watch — confirmation required.")
-        elif last.bear_score >= 4 and last.bear_score > last.bull_score:
-            st.error("Bearish setup watch — confirmation required.")
-        else:
-            st.warning("No high-confluence setup on the latest candle.")
-        display_cols = ["datetime", "open", "high", "low", "close", "volume",
-                        "ema20", "ema50", "bull_sweep", "bear_sweep",
-                        "bull_fvg", "bear_fvg", "bull_score", "bear_score"]
-        st.dataframe(analyzed[display_cols].tail(30), use_container_width=True)
-    except requests.HTTPError as exc:
-        st.error(f"Upstox HTTP error: {exc}. Check token, instrument key, and API access.")
-        if exc.response is not None:
-            st.code(exc.response.text[:1000])
-    except Exception as exc:
-        st.error(str(exc))
+        u = load_stock_fno_universe()
+        st.session_state["universe"] = u
+        st.success(f"Loaded {len(u)} unique stock-F&O underlyings from Upstox instrument master.")
+    except Exception as e:
+        st.error(f"Could not load instrument list: {e}")
 
-st.info("This is a single-instrument live-data connection test, not yet the full NSE F&O scanner. No orders are placed. FVG and sweep labels are simplified research heuristics, not proof of institutional activity.")
-st.caption("Options trading involves substantial risk. Verify all data and signals independently.")
+if "universe" not in st.session_state:
+    st.info("Tap **Load / refresh NSE F&O stock list** first.")
+else:
+    universe = st.session_state["universe"]
+    st.caption(f"Available stock-F&O underlyings: {len(universe)}. This run scans the first {min(limit, len(universe))} alphabetically; later versions will add rotating batches and prioritisation.")
+    if st.button("🚀 Start live scan", type="primary", disabled=not bool(token)):
+        rows, errors = [], []
+        selected = universe.head(limit)
+        progress = st.progress(0)
+        status = st.empty()
+        for i, row in selected.iterrows():
+            sym, key = row["underlying_symbol"], row["underlying_key"]
+            status.write(f"Scanning {sym} ({len(rows)+len(errors)+1}/{len(selected)})…")
+            try:
+                candles = fetch_candles(key, minutes, token)
+                result = score(candles, swing, vol_mult)
+                if result:
+                    result["Symbol"] = sym
+                    rows.append(result)
+                else:
+                    errors.append(f"{sym}: insufficient candles")
+            except Exception as e:
+                errors.append(f"{sym}: {str(e)[:120]}")
+            progress.progress((len(rows) + len(errors)) / len(selected))
+            time.sleep(0.12)
+        status.write("Scan complete.")
+        st.session_state["scan_rows"] = rows
+        st.session_state["scan_errors"] = errors
+        st.session_state["scan_tf"] = tf
+
+    if "scan_rows" in st.session_state:
+        results = pd.DataFrame(st.session_state["scan_rows"])
+        if not results.empty:
+            st.subheader(f"Results — {st.session_state.get('scan_tf', tf)}")
+            bull = results[(results["Bull score"] >= threshold) & (results["Bull score"] > results["Bear score"])].sort_values(["Bull score", "LTP"], ascending=[False, True])
+            bear = results[(results["Bear score"] >= threshold) & (results["Bear score"] > results["Bull score"])].sort_values(["Bear score", "LTP"], ascending=[False, True])
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("### 🟢 Bullish watchlist")
+                st.dataframe(bull.head(5), use_container_width=True, hide_index=True)
+            with c2:
+                st.markdown("### 🔴 Bearish watchlist")
+                st.dataframe(bear.head(5), use_container_width=True, hide_index=True)
+            st.markdown("### All scanned stocks")
+            st.dataframe(results.sort_values(["Bull score", "Bear score"], ascending=False), use_container_width=True, hide_index=True)
+            st.download_button("Download scan CSV", results.to_csv(index=False), "orderblock_pro_scan.csv", "text/csv")
+        else:
+            st.warning("No usable candle data returned for this batch.")
+        if st.session_state.get("scan_errors"):
+            with st.expander(f"Skipped / errors ({len(st.session_state['scan_errors'])})"):
+                st.write(st.session_state["scan_errors"])
+
+st.info("Signal logic is a simplified technical heuristic: EMA20/EMA50 trend, relative volume, recent swing sweep and three-candle FVG. It does not establish institutional activity or a verified win rate. No trades are placed.")
+st.caption("Options trading involves substantial risk. Confirm price, liquidity, spread, expiry and risk independently before any trade.")
