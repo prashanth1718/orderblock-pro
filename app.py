@@ -9,8 +9,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="OrderBlock Pro V4", page_icon="📊", layout="wide")
-st.title("📊 OrderBlock Pro V4 — NSE F&O + Options Intelligence")
+st.set_page_config(page_title="OrderBlock Pro V4.2", page_icon="📊", layout="wide")
+st.title("📊 OrderBlock Pro V4.2 — NSE F&O + Options Intelligence")
 st.caption("5m + 15m stock scan | ATM / ITM / OTM option-chain view | Greeks, OI and liquidity checks | No order placement")
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -46,15 +46,13 @@ def load_stock_fno_universe():
     return universe.sort_values("underlying_symbol").reset_index(drop=True)
 
 def fetch_candles(key, minutes, token):
-    # Pull several recent sessions: today's intraday endpoint alone cannot
-    # provide the 25+ bars required by EMA/volume calculations on 15m.
+    # Use multi-day historical candles so the 15-minute timeframe has enough
+    # bars early in the trading session (intraday endpoint returns today only).
     to_date = datetime.now(IST).date()
     from_date = to_date - pd.Timedelta(days=10)
-    url = (
-        f"{BASE}/historical-candle/{quote(key, safe='')}/minutes/{minutes}/"
-        f"{to_date.isoformat()}/{from_date.isoformat()}"
-    )
-    response = requests.get(url, headers=auth_headers(token), timeout=30)
+    encoded_key = quote(key, safe="")
+    url = f"{BASE}/historical-candle/{encoded_key}/minutes/{minutes}/{to_date}/{from_date}"
+    response = requests.get(url, headers=auth_headers(token), timeout=25)
     if response.status_code == 401:
         raise RuntimeError("Upstox token rejected/expired (401). Update Streamlit Secrets with a fresh token.")
     if response.status_code == 429:
@@ -68,7 +66,10 @@ def fetch_candles(key, minutes, token):
     for col in ["open", "high", "low", "close", "volume"]:
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
     frame["datetime"] = pd.to_datetime(frame["datetime"], errors="coerce")
-    return frame.dropna(subset=["datetime", "close"]).drop_duplicates(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
+    return (frame.dropna(subset=["datetime", "close"])
+            .drop_duplicates(subset=["datetime"])
+            .sort_values("datetime").reset_index(drop=True))
+
 
 def analyse(frame, swing_lookback, volume_multiple):
     if len(frame) < 25:
@@ -94,22 +95,31 @@ def analyse(frame, swing_lookback, volume_multiple):
         "candle_time": last["datetime"],
     }
 
+def raise_upstox_api_error(response, endpoint_name):
+    """Show the API's response detail without ever exposing request credentials."""
+    try:
+        payload = response.json()
+        detail = str(payload)[:700]
+    except Exception:
+        detail = (response.text or "No response body")[:700]
+    if response.status_code == 429:
+        raise RuntimeError(f"Upstox {endpoint_name} returned HTTP 429 (rate limit): {detail}")
+    if response.status_code == 401:
+        raise RuntimeError(f"Upstox {endpoint_name} returned HTTP 401 (authentication/permission response): {detail}")
+    raise RuntimeError(f"Upstox {endpoint_name} returned HTTP {response.status_code}: {detail}")
+
 def get_option_contracts(underlying_key, token):
     url = "https://api.upstox.com/v2/option/contract"
     response = requests.get(url, params={"instrument_key": underlying_key}, headers=auth_headers(token), timeout=25)
-    if response.status_code == 401:
-        raise RuntimeError("Upstox token rejected/expired (401). Refresh the token in Streamlit Secrets.")
-    response.raise_for_status()
+    if not response.ok:
+        raise_upstox_api_error(response, "Option Contracts API")
     return response.json().get("data", [])
 
 def get_option_chain(underlying_key, expiry, token):
     url = "https://api.upstox.com/v2/option/chain"
     response = requests.get(url, params={"instrument_key": underlying_key, "expiry_date": expiry}, headers=auth_headers(token), timeout=25)
-    if response.status_code == 401:
-        raise RuntimeError("Upstox token rejected/expired (401). Refresh the token in Streamlit Secrets.")
-    if response.status_code == 429:
-        raise RuntimeError("Upstox rate limit reached (429). Retry later with fewer symbols.")
-    response.raise_for_status()
+    if not response.ok:
+        raise_upstox_api_error(response, "Option Chain API")
     return response.json().get("data", [])
 
 def build_option_rows(symbol, underlying_key, direction, token, max_spread_pct):
@@ -286,9 +296,9 @@ else:
 st.caption("Technical heuristic only: EMA20/EMA50, relative volume, swing-sweep and three-candle FVG checks. It does not prove institutional activity or a profitable edge. No trades are placed.")
 
 
-# V4 Options Intelligence: separate, user-triggered option-chain lookup.
+# V4.2 Options Intelligence: separate, user-triggered option-chain lookup.
 st.divider()
-st.header("🧠 V4 Options Intelligence")
+st.header("🧠 V4.2 Options Intelligence")
 st.caption("Uses Upstox option contracts + option-chain endpoints. Displays CE for bullish candidates and PE for bearish candidates, with ATM, 1/2-step OTM and 1/2-step ITM. Greeks, OI, volume and bid/ask are shown only when supplied by the API.")
 max_spread = st.slider("Maximum bid–ask spread for liquidity PASS (%)", 1, 30, 10)
 if st.button("🔎 Load Options Intelligence", disabled=(not bool(token) or "v31_records" not in st.session_state)):
@@ -328,4 +338,4 @@ if "v4_options" in st.session_state:
         with st.expander(f"Option lookup warnings ({len(st.session_state['v4_option_errors'])})"):
             st.write(st.session_state["v4_option_errors"])
 
-st.caption("V4 is a first Options Intelligence integration, not a proven trading system. Futures OI confirmation and actual Order Block detection are not yet implemented. No automated order placement.")
+st.caption("V4.2 is a diagnostic update to the first Options Intelligence integration, not a proven trading system. Futures OI confirmation and actual Order Block detection are not yet implemented. No automated order placement.")
