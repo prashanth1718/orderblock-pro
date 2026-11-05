@@ -9,8 +9,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="OrderBlock Pro V4.2", page_icon="📊", layout="wide")
-st.title("📊 OrderBlock Pro V4.2 — NSE F&O + Options Intelligence")
+st.set_page_config(page_title="OrderBlock Pro V4.3", page_icon="📊", layout="wide")
+st.title("📊 OrderBlock Pro V4.3 — NSE F&O Trade Selection")
 st.caption("5m + 15m stock scan | ATM / ITM / OTM option-chain view | Greeks, OI and liquidity checks | No order placement")
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -173,6 +173,50 @@ def build_option_rows(symbol, underlying_key, direction, token, max_spread_pct):
         })
     return rows, None
 
+def rank_option_candidates(option_rows, scan_records):
+    """Transparent heuristic ranking; not a backtested or predictive model."""
+    if not option_rows:
+        return pd.DataFrame()
+    options = pd.DataFrame(option_rows).copy()
+    scan = pd.DataFrame(scan_records)
+    if options.empty or scan.empty:
+        return pd.DataFrame()
+    scan_cols = ["Symbol", "Bull total", "Bear total"]
+    options = options.merge(scan[scan_cols], on="Symbol", how="left")
+    options["Underlying strength"] = options.apply(
+        lambda r: float(r.get("Bull total", 0) if r.get("Bias") == "Bullish" else r.get("Bear total", 0)), axis=1
+    )
+    for col in ["Volume", "OI", "Spread %", "Delta"]:
+        options[col] = pd.to_numeric(options[col], errors="coerce")
+    options["Delta suitability"] = options.apply(
+        lambda r: 1.0 if pd.notna(r["Delta"]) and ((0.30 <= r["Delta"] <= 0.75) if r["Option"] == "CE" else (-0.75 <= r["Delta"] <= -0.30)) else 0.0,
+        axis=1
+    )
+    options["Moneyness score"] = options["Moneyness"].map({"ATM": 3, "1-step OTM": 2, "2-step OTM": 1, "1-step ITM": 1, "2-step ITM": 0}).fillna(0)
+    # Percentile ranks avoid arbitrary absolute volume/OI cutoffs across different stocks.
+    options["Volume rank"] = options["Volume"].rank(pct=True).fillna(0)
+    options["OI rank"] = options["OI"].rank(pct=True).fillna(0)
+    spread_quality = (1 - options["Spread %"].clip(lower=0, upper=10) / 10).fillna(0)
+    options["Selection score"] = (
+        options["Underlying strength"] * 10
+        + options["Volume rank"] * 20
+        + options["OI rank"] * 10
+        + spread_quality * 20
+        + options["Delta suitability"] * 15
+        + options["Moneyness score"] * 5
+    ).round(1)
+    # Ask is the conservative displayed reference for a potential buy; quotes can change instantly.
+    options["Indicative entry (Ask)"] = options["Ask"]
+    options["Illustrative SL (-20%)"] = (options["Ask"] * 0.80).round(2)
+    options["Illustrative T1 (+40%)"] = (options["Ask"] * 1.40).round(2)
+    options["Illustrative T2 (+60%)"] = (options["Ask"] * 1.60).round(2)
+    options["Illustrative R:R to T1"] = "1:2"
+    eligible = options[options["Liquidity"] == "PASS"].copy()
+    # One best contract per underlying; rank across all symbols in each direction.
+    eligible = eligible.sort_values(["Selection score", "Volume"], ascending=False)
+    eligible = eligible.drop_duplicates(subset=["Symbol", "Bias"], keep="first")
+    return eligible
+
 def market_status(now):
     if now.weekday() >= 5:
         return "Market closed (weekend)"
@@ -296,9 +340,9 @@ else:
 st.caption("Technical heuristic only: EMA20/EMA50, relative volume, swing-sweep and three-candle FVG checks. It does not prove institutional activity or a profitable edge. No trades are placed.")
 
 
-# V4.2 Options Intelligence: separate, user-triggered option-chain lookup.
+# V4.3 Trade Selection Dashboard: separate, user-triggered option-chain lookup.
 st.divider()
-st.header("🧠 V4.2 Options Intelligence")
+st.header("🧠 V4.3 Trade Selection Dashboard")
 st.caption("Uses Upstox option contracts + option-chain endpoints. Displays CE for bullish candidates and PE for bearish candidates, with ATM, 1/2-step OTM and 1/2-step ITM. Greeks, OI, volume and bid/ask are shown only when supplied by the API.")
 max_spread = st.slider("Maximum bid–ask spread for liquidity PASS (%)", 1, 30, 10)
 if st.button("🔎 Load Options Intelligence", disabled=(not bool(token) or "v31_records" not in st.session_state)):
@@ -332,10 +376,27 @@ if "v4_options" in st.session_state:
     if not opt_df.empty:
         st.markdown("**Liquidity PASS** means live LTP, bid, ask and volume are present and spread is within your selected limit. REJECT rows are displayed for comparison, not trade selection.**")
         st.dataframe(opt_df.drop(columns=["Instrument Key"]), use_container_width=True, hide_index=True)
-        st.download_button("Download Options Intelligence CSV", opt_df.to_csv(index=False), "orderblock_pro_v4_options.csv", "text/csv")
-        st.info("Reference SL/T1/T2 are simple premium-percentage illustrations (-20%, +40%, +60%), not chart-derived levels, not guaranteed, and not validated. They imply 1:2 and 1:3 reward/risk before brokerage, slippage and gaps. Only consider rows marked PASS; confirm live quotes before any decision.")
+        st.download_button("Download Options Intelligence CSV", opt_df.to_csv(index=False), "orderblock_pro_v4_3_options_all.csv", "text/csv")
+        ranked = rank_option_candidates(st.session_state["v4_options"], st.session_state.get("v31_records", []))
+        st.divider()
+        st.subheader("🏆 Ranked trade candidates — research shortlist")
+        if ranked.empty:
+            st.warning("No contracts passed the current liquidity filter. Do not force a trade; widen the scan or wait for better liquidity.")
+        else:
+            ce = ranked[ranked["Bias"] == "Bullish"].sort_values("Selection score", ascending=False).head(5)
+            pe = ranked[ranked["Bias"] == "Bearish"].sort_values("Selection score", ascending=False).head(5)
+            display_cols = ["Symbol", "Bias", "Expiry", "Option", "Strike", "Moneyness", "Spot", "LTP", "Bid", "Ask", "Spread %", "Volume", "OI", "Delta", "Theta", "Selection score", "Indicative entry (Ask)", "Illustrative SL (-20%)", "Illustrative T1 (+40%)", "Illustrative T2 (+60%)", "Illustrative R:R to T1"]
+            a, b = st.columns(2)
+            with a:
+                st.markdown("#### 🟢 Top bullish CE")
+                st.dataframe(ce[[c for c in display_cols if c in ce.columns]], use_container_width=True, hide_index=True)
+            with b:
+                st.markdown("#### 🔴 Top bearish PE")
+                st.dataframe(pe[[c for c in display_cols if c in pe.columns]], use_container_width=True, hide_index=True)
+            st.download_button("Download ranked shortlist CSV", ranked.to_csv(index=False), "orderblock_pro_v4_3_ranked_shortlist.csv", "text/csv")
+        st.info("Ranking is a transparent heuristic using underlying 5m/15m score, option volume/OI percentiles, spread, delta suitability and strike distance. Entry uses displayed Ask. SL/T1/T2 are illustrative premium percentages only—not chart-derived, backtested, or validated trade levels. Quotes change rapidly; confirm the live chain before making any decision.")
     if st.session_state.get("v4_option_errors"):
         with st.expander(f"Option lookup warnings ({len(st.session_state['v4_option_errors'])})"):
             st.write(st.session_state["v4_option_errors"])
 
-st.caption("V4.2 is a diagnostic update to the first Options Intelligence integration, not a proven trading system. Futures OI confirmation and actual Order Block detection are not yet implemented. No automated order placement.")
+st.caption("V4.3 adds a heuristic ranked shortlist on top of the V4.2 options integration, not a proven trading system. Futures OI confirmation and actual Order Block detection are not yet implemented. No automated order placement.")
