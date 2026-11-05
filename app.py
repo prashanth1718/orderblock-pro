@@ -9,8 +9,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="OrderBlock Pro V4.3", page_icon="📊", layout="wide")
-st.title("📊 OrderBlock Pro V4.3 — NSE F&O Trade Selection")
+st.set_page_config(page_title="OrderBlock Pro V4.4", page_icon="📊", layout="wide")
+st.title("📊 OrderBlock Pro V4.4 — NSE F&O Trade Selection")
 st.caption("5m + 15m stock scan | ATM / ITM / OTM option-chain view | Greeks, OI and liquidity checks | No order placement")
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -94,6 +94,68 @@ def analyse(frame, swing_lookback, volume_multiple):
         "bull_sweep": bool(bull_sweep.iloc[-1]), "bear_sweep": bool(bear_sweep.iloc[-1]),
         "candle_time": last["datetime"],
     }
+
+def detect_price_action_levels(frame, direction):
+    """Experimental 5m structure levels: simple OB/FVG heuristics, not validated ICT signals."""
+    if frame is None or len(frame) < 12:
+        return {"OB zone": None, "FVG zone": None, "Structure SL": None,
+                "Target 1 (1R)": None, "Target 2 (2R)": None, "Level status": "Insufficient candles"}
+    x = frame.tail(60).copy().reset_index(drop=True)
+    for c in ["open", "high", "low", "close"]:
+        x[c] = pd.to_numeric(x[c], errors="coerce")
+    x = x.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
+    if len(x) < 12:
+        return {"OB zone": None, "FVG zone": None, "Structure SL": None,
+                "Target 1 (1R)": None, "Target 2 (2R)": None, "Level status": "Insufficient candles"}
+    last = x.iloc[-1]
+    price = float(last["close"])
+    ob = None
+    fvg = None
+    # Find the most recent opposite-colour candle preceding a directional displacement.
+    start = max(2, len(x) - 25)
+    for i in range(len(x) - 1, start - 1, -1):
+        prev = x.iloc[i - 1]
+        recent = x.iloc[max(0, i - 5):i]
+        if len(recent) < 3:
+            continue
+        if direction == "Bullish":
+            prior_high = float(recent["high"].max())
+            impulse = float(x.iloc[i]["close"]) > prior_high and float(x.iloc[i]["close"]) > float(x.iloc[i]["open"])
+            if impulse and float(prev["close"]) < float(prev["open"]):
+                ob = (float(prev["low"]), float(prev["high"]))
+                break
+        else:
+            prior_low = float(recent["low"].min())
+            impulse = float(x.iloc[i]["close"]) < prior_low and float(x.iloc[i]["close"]) < float(x.iloc[i]["open"])
+            if impulse and float(prev["close"]) > float(prev["open"]):
+                ob = (float(prev["low"]), float(prev["high"]))
+                break
+    # Latest three-candle fair-value gap, searched backwards.
+    for i in range(len(x) - 1, 1, -1):
+        a, c = x.iloc[i - 2], x.iloc[i]
+        if direction == "Bullish" and float(c["low"]) > float(a["high"]):
+            fvg = (float(a["high"]), float(c["low"]))
+            break
+        if direction == "Bearish" and float(c["high"]) < float(a["low"]):
+            fvg = (float(c["high"]), float(a["low"]))
+            break
+    if ob is None:
+        return {"OB zone": None, "FVG zone": f"{fvg[0]:.2f}–{fvg[1]:.2f}" if fvg else None,
+                "Structure SL": None, "Target 1 (1R)": None, "Target 2 (2R)": None,
+                "Level status": "No qualifying OB found"}
+    lo, hi = ob
+    # Stop is beyond the detected OB with a small 0.1% buffer; targets are R multiples from last close.
+    stop = lo * 0.999 if direction == "Bullish" else hi * 1.001
+    risk = price - stop if direction == "Bullish" else stop - price
+    if risk <= 0:
+        return {"OB zone": f"{lo:.2f}–{hi:.2f}", "FVG zone": f"{fvg[0]:.2f}–{fvg[1]:.2f}" if fvg else None,
+                "Structure SL": round(stop, 2), "Target 1 (1R)": None, "Target 2 (2R)": None,
+                "Level status": "Price already beyond invalidation level"}
+    t1 = price + risk if direction == "Bullish" else price - risk
+    t2 = price + 2 * risk if direction == "Bullish" else price - 2 * risk
+    return {"OB zone": f"{lo:.2f}–{hi:.2f}", "FVG zone": f"{fvg[0]:.2f}–{fvg[1]:.2f}" if fvg else None,
+            "Structure SL": round(stop, 2), "Target 1 (1R)": round(t1, 2),
+            "Target 2 (2R)": round(t2, 2), "Level status": "Experimental structure levels"}
 
 def raise_upstox_api_error(response, endpoint_name):
     """Show the API's response detail without ever exposing request credentials."""
@@ -273,8 +335,12 @@ else:
             symbol, key = item["underlying_symbol"], item["underlying_key"]
             status.write(f"Scanning {symbol}: 5m + 15m ({count}/{count_to_scan})")
             try:
-                five = analyse(fetch_candles(key, 5, token), swing, vol_mult)
-                fifteen = analyse(fetch_candles(key, 15, token), swing, vol_mult)
+                five_frame = fetch_candles(key, 5, token)
+                fifteen_frame = fetch_candles(key, 15, token)
+                five = analyse(five_frame, swing, vol_mult)
+                fifteen = analyse(fifteen_frame, swing, vol_mult)
+                bull_levels = detect_price_action_levels(five_frame, "Bullish")
+                bear_levels = detect_price_action_levels(five_frame, "Bearish")
                 if five is None or fifteen is None:
                     errors.append(f"{symbol}: insufficient 5m or 15m candles")
                 else:
@@ -292,6 +358,8 @@ else:
                         "15m bear sweep": "Yes" if fifteen["bear_sweep"] else "No",
                         "5m candle time": str(five["candle_time"]),
                         "15m candle time": str(fifteen["candle_time"]),
+                        **{f"Bull {k}": v for k, v in bull_levels.items()},
+                        **{f"Bear {k}": v for k, v in bear_levels.items()},
                     })
             except Exception as exc:
                 errors.append(f"{symbol}: {str(exc)[:140]}")
@@ -329,6 +397,11 @@ else:
             st.markdown("### All usable scanned stocks")
             st.dataframe(data.sort_values(["Bull total", "Bear total"], ascending=False), use_container_width=True, hide_index=True)
             st.download_button("Download scan CSV", data.to_csv(index=False), "orderblock_pro_full_scan.csv", "text/csv")
+            st.markdown("### 🎯 Experimental 5m Order Block / FVG levels")
+            st.caption("Underlying-price levels only. OB/FVG detection is a simple candle heuristic, not a validated ICT model. Entry is the latest 5m close; SL is beyond the detected OB; targets are 1R and 2R. If no qualifying OB exists, levels are withheld.")
+            level_cols = ["Symbol", "LTP", "Bull OB zone", "Bull FVG zone", "Bull Structure SL", "Bull Target 1 (1R)", "Bull Target 2 (2R)", "Bull Level status", "Bear OB zone", "Bear FVG zone", "Bear Structure SL", "Bear Target 1 (1R)", "Bear Target 2 (2R)", "Bear Level status"]
+            st.dataframe(data[[c for c in level_cols if c in data.columns]], use_container_width=True, hide_index=True)
+            st.download_button("Download price-action levels CSV", data[[c for c in level_cols if c in data.columns]].to_csv(index=False), "orderblock_pro_v4_4_price_action_levels.csv", "text/csv")
             if bullish.empty and bearish.empty:
                 st.info("No stocks met the selected threshold on both timeframes. Do not force signals by lowering filters.")
         else:
@@ -340,9 +413,9 @@ else:
 st.caption("Technical heuristic only: EMA20/EMA50, relative volume, swing-sweep and three-candle FVG checks. It does not prove institutional activity or a profitable edge. No trades are placed.")
 
 
-# V4.3 Trade Selection Dashboard: separate, user-triggered option-chain lookup.
+# V4.4 Trade Selection Dashboard: separate, user-triggered option-chain lookup.
 st.divider()
-st.header("🧠 V4.3 Trade Selection Dashboard")
+st.header("🧠 V4.4 Trade Selection Dashboard")
 st.caption("Uses Upstox option contracts + option-chain endpoints. Displays CE for bullish candidates and PE for bearish candidates, with ATM, 1/2-step OTM and 1/2-step ITM. Greeks, OI, volume and bid/ask are shown only when supplied by the API.")
 max_spread = st.slider("Maximum bid–ask spread for liquidity PASS (%)", 1, 30, 10)
 if st.button("🔎 Load Options Intelligence", disabled=(not bool(token) or "v31_records" not in st.session_state)):
@@ -399,4 +472,4 @@ if "v4_options" in st.session_state:
         with st.expander(f"Option lookup warnings ({len(st.session_state['v4_option_errors'])})"):
             st.write(st.session_state["v4_option_errors"])
 
-st.caption("V4.3 adds a heuristic ranked shortlist on top of the V4.2 options integration, not a proven trading system. Futures OI confirmation and actual Order Block detection are not yet implemented. No automated order placement.")
+st.caption("V4.4 adds a heuristic ranked shortlist and experimental price-action levels on top of the V4.2 options integration, not a proven trading system. Futures OI confirmation and actual Order Block detection are not yet implemented. No automated order placement.")
