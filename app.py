@@ -9,8 +9,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="OrderBlock Pro V4.4", page_icon="📊", layout="wide")
-st.title("📊 OrderBlock Pro V4.4 — NSE F&O Trade Selection")
+st.set_page_config(page_title="OrderBlock Pro V4.5", page_icon="📊", layout="wide")
+st.title("📊 OrderBlock Pro V4.5 — NSE F&O Trade Selection")
 st.caption("5m + 15m stock scan | ATM / ITM / OTM option-chain view | Greeks, OI and liquidity checks | No order placement")
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -95,67 +95,98 @@ def analyse(frame, swing_lookback, volume_multiple):
         "candle_time": last["datetime"],
     }
 
-def detect_price_action_levels(frame, direction):
-    """Experimental 5m structure levels: simple OB/FVG heuristics, not validated ICT signals."""
-    if frame is None or len(frame) < 12:
-        return {"OB zone": None, "FVG zone": None, "Structure SL": None,
-                "Target 1 (1R)": None, "Target 2 (2R)": None, "Level status": "Insufficient candles"}
-    x = frame.tail(60).copy().reset_index(drop=True)
-    for c in ["open", "high", "low", "close"]:
+def detect_price_action_levels(frame, direction, min_ob_score=3):
+    """Experimental OB quality filter with displacement, structure break, sweep, mitigation and invalidation checks."""
+    empty = {"OB zone": None, "FVG zone": None, "Structure SL": None,
+             "Target 1 (1R)": None, "Target 2 (2R)": None,
+             "OB strength": 0, "OB state": "Not found", "Liquidity sweep": "No",
+             "Level status": "No qualifying OB found"}
+    if frame is None or len(frame) < 30:
+        empty["Level status"] = "Insufficient candles"
+        return empty
+    x = frame.tail(100).copy().reset_index(drop=True)
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c not in x: x[c] = 0
         x[c] = pd.to_numeric(x[c], errors="coerce")
     x = x.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
-    if len(x) < 12:
-        return {"OB zone": None, "FVG zone": None, "Structure SL": None,
-                "Target 1 (1R)": None, "Target 2 (2R)": None, "Level status": "Insufficient candles"}
-    last = x.iloc[-1]
-    price = float(last["close"])
-    ob = None
+    if len(x) < 30:
+        empty["Level status"] = "Insufficient candles"
+        return empty
+    rng = (x["high"] - x["low"]).replace(0, pd.NA)
+    body = (x["close"] - x["open"]).abs()
+    atr = rng.rolling(14, min_periods=5).mean()
+    volavg = x["volume"].rolling(20, min_periods=5).mean()
+    last_price = float(x.iloc[-1]["close"])
+    # Latest valid three-candle FVG.
     fvg = None
-    # Find the most recent opposite-colour candle preceding a directional displacement.
-    start = max(2, len(x) - 25)
-    for i in range(len(x) - 1, start - 1, -1):
-        prev = x.iloc[i - 1]
-        recent = x.iloc[max(0, i - 5):i]
-        if len(recent) < 3:
-            continue
+    for i in range(len(x)-1, 1, -1):
+        a, c = x.iloc[i-2], x.iloc[i]
+        if direction == "Bullish" and float(c.low) > float(a.high):
+            fvg = (float(a.high), float(c.low)); break
+        if direction == "Bearish" and float(c.high) < float(a.low):
+            fvg = (float(c.high), float(a.low)); break
+    # Sweep of a prior 10-bar extreme, followed by close back through the level.
+    sweep = False
+    for i in range(max(10, len(x)-8), len(x)):
+        prior = x.iloc[max(0, i-10):i]
+        if len(prior) < 5: continue
+        row = x.iloc[i]
+        if direction == "Bullish" and row.low < prior.low.min() and row.close > prior.low.min(): sweep=True
+        if direction == "Bearish" and row.high > prior.high.max() and row.close < prior.high.max(): sweep=True
+    candidates=[]
+    # Search recent opposite candle followed by a strong displacement and local structure break.
+    for i in range(max(2, len(x)-35), len(x)-1):
+        ob=x.iloc[i]
+        nxt=x.iloc[i+1]
+        local=x.iloc[max(0,i-8):i]
+        if len(local)<5: continue
+        is_opposite = (ob.close < ob.open) if direction == "Bullish" else (ob.close > ob.open)
+        if not is_opposite: continue
         if direction == "Bullish":
-            prior_high = float(recent["high"].max())
-            impulse = float(x.iloc[i]["close"]) > prior_high and float(x.iloc[i]["close"]) > float(x.iloc[i]["open"])
-            if impulse and float(prev["close"]) < float(prev["open"]):
-                ob = (float(prev["low"]), float(prev["high"]))
-                break
+            displacement = nxt.close > nxt.open and nxt.close > local.high.max()
         else:
-            prior_low = float(recent["low"].min())
-            impulse = float(x.iloc[i]["close"]) < prior_low and float(x.iloc[i]["close"]) < float(x.iloc[i]["open"])
-            if impulse and float(prev["close"]) > float(prev["open"]):
-                ob = (float(prev["low"]), float(prev["high"]))
-                break
-    # Latest three-candle fair-value gap, searched backwards.
-    for i in range(len(x) - 1, 1, -1):
-        a, c = x.iloc[i - 2], x.iloc[i]
-        if direction == "Bullish" and float(c["low"]) > float(a["high"]):
-            fvg = (float(a["high"]), float(c["low"]))
-            break
-        if direction == "Bearish" and float(c["high"]) < float(a["low"]):
-            fvg = (float(c["high"]), float(a["low"]))
-            break
-    if ob is None:
-        return {"OB zone": None, "FVG zone": f"{fvg[0]:.2f}–{fvg[1]:.2f}" if fvg else None,
-                "Structure SL": None, "Target 1 (1R)": None, "Target 2 (2R)": None,
-                "Level status": "No qualifying OB found"}
-    lo, hi = ob
-    # Stop is beyond the detected OB with a small 0.1% buffer; targets are R multiples from last close.
-    stop = lo * 0.999 if direction == "Bullish" else hi * 1.001
-    risk = price - stop if direction == "Bullish" else stop - price
+            displacement = nxt.close < nxt.open and nxt.close < local.low.min()
+        atr_i = float(atr.iloc[i+1]) if pd.notna(atr.iloc[i+1]) else 0
+        vol_i = float(volavg.iloc[i+1]) if pd.notna(volavg.iloc[i+1]) else 0
+        impulse = float(body.iloc[i+1]) >= 0.8*atr_i if atr_i > 0 else False
+        volume_ok = float(nxt.volume) >= 1.2*vol_i if vol_i > 0 else False
+        if not (displacement and impulse): continue
+        lo,hi=float(ob.low),float(ob.high)
+        later=x.iloc[i+2:]
+        if direction == "Bullish":
+            invalid = bool((later.close < lo).any())
+            touched = bool(((later.low <= hi) & (later.high >= lo)).any())
+            still_valid = last_price > lo
+            stop=lo*0.999
+        else:
+            invalid = bool((later.close > hi).any())
+            touched = bool(((later.high >= lo) & (later.low <= hi)).any())
+            still_valid = last_price < hi
+            stop=hi*1.001
+        state = "Invalidated" if invalid or not still_valid else ("Mitigated" if touched else "Fresh")
+        score = 2 + int(volume_ok) + int(sweep) + int(state == "Fresh")
+        candidates.append((score, i, lo, hi, stop, state, volume_ok))
+    valid=[c for c in candidates if c[0] >= min_ob_score and c[5] != "Invalidated"]
+    if not valid:
+        out=empty.copy()
+        out["FVG zone"] = f"{fvg[0]:.2f}–{fvg[1]:.2f}" if fvg else None
+        out["Liquidity sweep"] = "Yes" if sweep else "No"
+        out["OB strength"] = max([c[0] for c in candidates], default=0)
+        out["OB state"] = "No qualifying zone"
+        out["Level status"] = "No strong, non-invalidated OB"
+        return out
+    score,i,lo,hi,stop,state,volume_ok=max(valid, key=lambda z:(z[0],z[1]))
+    risk = last_price-stop if direction == "Bullish" else stop-last_price
     if risk <= 0:
-        return {"OB zone": f"{lo:.2f}–{hi:.2f}", "FVG zone": f"{fvg[0]:.2f}–{fvg[1]:.2f}" if fvg else None,
-                "Structure SL": round(stop, 2), "Target 1 (1R)": None, "Target 2 (2R)": None,
-                "Level status": "Price already beyond invalidation level"}
-    t1 = price + risk if direction == "Bullish" else price - risk
-    t2 = price + 2 * risk if direction == "Bullish" else price - 2 * risk
-    return {"OB zone": f"{lo:.2f}–{hi:.2f}", "FVG zone": f"{fvg[0]:.2f}–{fvg[1]:.2f}" if fvg else None,
-            "Structure SL": round(stop, 2), "Target 1 (1R)": round(t1, 2),
-            "Target 2 (2R)": round(t2, 2), "Level status": "Experimental structure levels"}
+        empty.update({"OB zone":f"{lo:.2f}–{hi:.2f}","OB strength":score,"OB state":state,
+                      "Liquidity sweep":"Yes" if sweep else "No","Level status":"Price beyond invalidation level"})
+        return empty
+    t1=last_price+risk if direction == "Bullish" else last_price-risk
+    t2=last_price+2*risk if direction == "Bullish" else last_price-2*risk
+    return {"OB zone":f"{lo:.2f}–{hi:.2f}","FVG zone":f"{fvg[0]:.2f}–{fvg[1]:.2f}" if fvg else None,
+            "Structure SL":round(stop,2),"Target 1 (1R)":round(t1,2),"Target 2 (2R)":round(t2,2),
+            "OB strength":score,"OB state":state,"Liquidity sweep":"Yes" if sweep else "No",
+            "Level status":"Experimental quality-filtered structure levels"}
 
 def raise_upstox_api_error(response, endpoint_name):
     """Show the API's response detail without ever exposing request credentials."""
@@ -339,8 +370,8 @@ else:
                 fifteen_frame = fetch_candles(key, 15, token)
                 five = analyse(five_frame, swing, vol_mult)
                 fifteen = analyse(fifteen_frame, swing, vol_mult)
-                bull_levels = detect_price_action_levels(five_frame, "Bullish")
-                bear_levels = detect_price_action_levels(five_frame, "Bearish")
+                bull_levels = detect_price_action_levels(five_frame, "Bullish", min_ob_score=3)
+                bear_levels = detect_price_action_levels(five_frame, "Bearish", min_ob_score=3)
                 if five is None or fifteen is None:
                     errors.append(f"{symbol}: insufficient 5m or 15m candles")
                 else:
@@ -397,11 +428,11 @@ else:
             st.markdown("### All usable scanned stocks")
             st.dataframe(data.sort_values(["Bull total", "Bear total"], ascending=False), use_container_width=True, hide_index=True)
             st.download_button("Download scan CSV", data.to_csv(index=False), "orderblock_pro_full_scan.csv", "text/csv")
-            st.markdown("### 🎯 Experimental 5m Order Block / FVG levels")
-            st.caption("Underlying-price levels only. OB/FVG detection is a simple candle heuristic, not a validated ICT model. Entry is the latest 5m close; SL is beyond the detected OB; targets are 1R and 2R. If no qualifying OB exists, levels are withheld.")
-            level_cols = ["Symbol", "LTP", "Bull OB zone", "Bull FVG zone", "Bull Structure SL", "Bull Target 1 (1R)", "Bull Target 2 (2R)", "Bull Level status", "Bear OB zone", "Bear FVG zone", "Bear Structure SL", "Bear Target 1 (1R)", "Bear Target 2 (2R)", "Bear Level status"]
+            st.markdown("### 🎯 V4.5 Quality-filtered 5m Order Block / FVG levels")
+            st.caption("Underlying-price levels only. OB/FVG detection is an experimental candle heuristic, not a validated ICT model. Candidate OBs require displacement and a local structure break; volume, sweep, freshness and invalidation affect filtering/scoring. If no qualifying OB exists, levels are withheld.")
+            level_cols = ["Symbol", "LTP", "Bull OB zone", "Bull FVG zone", "Bull Structure SL", "Bull Target 1 (1R)", "Bull Target 2 (2R)", "Bull OB strength", "Bull OB state", "Bull Liquidity sweep", "Bull Level status", "Bear OB zone", "Bear FVG zone", "Bear Structure SL", "Bear Target 1 (1R)", "Bear Target 2 (2R)", "Bear OB strength", "Bear OB state", "Bear Liquidity sweep", "Bear Level status"]
             st.dataframe(data[[c for c in level_cols if c in data.columns]], use_container_width=True, hide_index=True)
-            st.download_button("Download price-action levels CSV", data[[c for c in level_cols if c in data.columns]].to_csv(index=False), "orderblock_pro_v4_4_price_action_levels.csv", "text/csv")
+            st.download_button("Download price-action levels CSV", data[[c for c in level_cols if c in data.columns]].to_csv(index=False), "orderblock_pro_v4_5_price_action_levels.csv", "text/csv")
             if bullish.empty and bearish.empty:
                 st.info("No stocks met the selected threshold on both timeframes. Do not force signals by lowering filters.")
         else:
@@ -413,9 +444,9 @@ else:
 st.caption("Technical heuristic only: EMA20/EMA50, relative volume, swing-sweep and three-candle FVG checks. It does not prove institutional activity or a profitable edge. No trades are placed.")
 
 
-# V4.4 Trade Selection Dashboard: separate, user-triggered option-chain lookup.
+# V4.5 Trade Selection Dashboard: separate, user-triggered option-chain lookup.
 st.divider()
-st.header("🧠 V4.4 Trade Selection Dashboard")
+st.header("🧠 V4.5 Trade Selection Dashboard")
 st.caption("Uses Upstox option contracts + option-chain endpoints. Displays CE for bullish candidates and PE for bearish candidates, with ATM, 1/2-step OTM and 1/2-step ITM. Greeks, OI, volume and bid/ask are shown only when supplied by the API.")
 max_spread = st.slider("Maximum bid–ask spread for liquidity PASS (%)", 1, 30, 10)
 if st.button("🔎 Load Options Intelligence", disabled=(not bool(token) or "v31_records" not in st.session_state)):
@@ -472,4 +503,4 @@ if "v4_options" in st.session_state:
         with st.expander(f"Option lookup warnings ({len(st.session_state['v4_option_errors'])})"):
             st.write(st.session_state["v4_option_errors"])
 
-st.caption("V4.4 adds a heuristic ranked shortlist and experimental price-action levels on top of the V4.2 options integration, not a proven trading system. Futures OI confirmation and actual Order Block detection are not yet implemented. No automated order placement.")
+st.caption("V4.5 adds quality-filtered experimental OB zones and a heuristic ranked shortlist and experimental price-action levels on top of the V4.2 options integration, not a proven trading system. Futures OI confirmation and institutional order-flow confirmation is not implemented. No automated order placement.")
