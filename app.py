@@ -46,8 +46,15 @@ def load_stock_fno_universe():
     return universe.sort_values("underlying_symbol").reset_index(drop=True)
 
 def fetch_candles(key, minutes, token):
-    url = f"{BASE}/historical-candle/intraday/{quote(key, safe='')}/minutes/{minutes}"
-    response = requests.get(url, headers=auth_headers(token), timeout=25)
+    # Pull several recent sessions: today's intraday endpoint alone cannot
+    # provide the 25+ bars required by EMA/volume calculations on 15m.
+    to_date = datetime.now(IST).date()
+    from_date = to_date - pd.Timedelta(days=10)
+    url = (
+        f"{BASE}/historical-candle/{quote(key, safe='')}/minutes/{minutes}/"
+        f"{to_date.isoformat()}/{from_date.isoformat()}"
+    )
+    response = requests.get(url, headers=auth_headers(token), timeout=30)
     if response.status_code == 401:
         raise RuntimeError("Upstox token rejected/expired (401). Update Streamlit Secrets with a fresh token.")
     if response.status_code == 429:
@@ -61,7 +68,7 @@ def fetch_candles(key, minutes, token):
     for col in ["open", "high", "low", "close", "volume"]:
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
     frame["datetime"] = pd.to_datetime(frame["datetime"], errors="coerce")
-    return frame.dropna(subset=["datetime", "close"]).sort_values("datetime").reset_index(drop=True)
+    return frame.dropna(subset=["datetime", "close"]).drop_duplicates(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
 
 def analyse(frame, swing_lookback, volume_multiple):
     if len(frame) < 25:
